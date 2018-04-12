@@ -1,0 +1,1226 @@
+# This code does general focalflow given parameters using tensorflow
+# Author: Qi Guo, Harvard University
+# Email: qguo@seas.harvard.edu
+# All Rights Reserved
+
+import tensorflow as tf
+import numpy as np
+import cv2
+from scipy import signal
+import pdb
+import pickle
+from utils import *
+from training_focalFlowNet import training_focalFlowNet
+from training_focalFlowNet import KEY_RANGE
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import math
+import os, glob
+
+NAN_COLOR = np.array([0,0,255])
+FONT_COLOR = (0,255,0)
+
+PADDING = 'VALID'
+class pyConfLensFlowNetFast_iccv(training_focalFlowNet):
+	"""constructor: initializes FocalFlowProcessor"""
+	def __init__(self, cfg = None):
+		#default configuraiton
+		self.cfg = []
+		self.cfg.append({
+			# finite difference coefficient
+			'gauss': np.array([[0.0023,0.0216,0.0216,0.0023],\
+				[0.0216,0.2046,0.2046,0.0216],\
+				[0.0216,0.2046,0.2046,0.0216],\
+				[0.0023,0.0216,0.0216,0.0023]]),
+			'ft': np.array([[[-0.5,0.5]]]),
+			'fave': np.array([[[0.5,0.5]]]),
+			'a0' : 1, #sensor distance
+			'da0_ratio': 1, #adjust the scale to converge faster
+			'a1' : 1, #focal distance
+			'da1_ratio': 1, #adjust the scale to converge faster
+			'Z_0': 0,
+			'dZ_0_ratio': 1,
+			# convolution window
+			'separable' : True, # indicator of separability of conv
+			'w' : np.ones((35,35)), # unseparable window
+			'wx': np.ones((1,345)), # separable window
+			'wy': np.ones((345,1)), # separable window
+			# other parameters
+			'szx_sensor': 200,
+			'szy_sensor': 200,
+			'outs': 'Z',
+			'learn_rate': 0.01,
+			'err_func': 'huber_err',
+			'conf_func': 'baseline_conf',
+			'fc': \
+				np.array(\
+					[\
+						[[1,1],[1,1],[1,1]],\
+						[[1,1],[1,1],[1,1]],\
+						[[1,1],[1,1],[1,1]],\
+					]\
+				),
+			'ac': 1,
+		})
+
+		# change configurations according to the input
+		if cfg != None:
+			self.cfg = cfg
+
+		# add the cfg of fusion
+		self.fused_cfg = {
+			'separable'		:		True,
+			'wx'			:		np.ones((1,3)),
+			'wy'			:		np.ones((3,1)),
+			'w'				:		np.ones((3,3)),
+		}
+
+		# resolution
+		self.resolution = []
+		for i in range(len(self.cfg)):
+			self.resolution.append(
+				(
+					self.cfg[i]['szy_sensor'], 
+					self.cfg[i]['szx_sensor']
+				)
+			)
+			self.cfg[i]['P'] = 1/self.cfg[i]['f']
+
+		# add a variable
+		for i in range(len(self.cfg)):
+			self.cfg[i]['a0a1'] = self.cfg[i]['a0'] * self.cfg[0]['a1']
+
+		# variables
+		self.vars = []
+		self.vars_align = {}
+		self.vars_fuse = {}
+
+		self.image_to_show = ['Z','conf','Z_gt']
+		self.vars_to_fuse = ['Z','conf']
+
+		# miscellaneous
+		self.cache = {}
+		self.graph = tf.Graph()
+		self.session = tf.Session(graph = self.graph)
+		self.build_graph()
+		
+		self.netName = "Training Lens Flow"
+
+	"""describes the computations (graph) to run later
+		-make all algorithmic changes here
+		-note that tensorflow has a lot of support for backpropagation 
+		 gradient descent/training, so you can build another part of the 
+		 graph that computes and updates weights here as well. 
+	"""
+	def input_images(self, I, Z, offset):
+		# import data into the network
+		# I, I_lap_batch and Z should be a n-element tuple
+		input_dict = {}
+		input_dict[self.I_in] = I
+		input_dict[self.Z_in] = Z
+		input_dict[self.offset] = offset
+		self.session.run(self.input_data, input_dict)
+		return
+
+	def build_graph(self):
+		with self.graph.as_default():
+			# initialization of all variables
+			I_init = np.zeros(
+				self.resolution[0]+(self.cfg[0]['ft'].shape[2],),
+				dtype = np.float32
+			)
+			self.I_in = tf.Variable(I_init)
+			I = tf.Variable(I_init)
+
+			self.offset = tf.Variable(1, dtype=tf.float32)
+			offset = tf.Variable(1, dtype=tf.float32)
+
+			self.b0 = tf.Variable(1, dtype=tf.float32)
+			b0 = tf.Variable(1, dtype=tf.float32)
+
+			self.b1 = tf.Variable(1, dtype=tf.float32)
+			b1 = tf.Variable(1, dtype=tf.float32)
+
+			a1 = 1./(offset*b0 + b1)
+
+			I_batch = []
+			I_lap_batch = []
+
+			Z_init = np.zeros(
+				self.resolution[0],
+				dtype = np.float32
+			)
+			self.Z_in = tf.Variable(Z_init)
+			Z_gt = tf.Variable(Z_init)
+			Z_gt0 = []
+
+			Z_0 = []
+			a0 = []
+			gauss = []
+			ext_f = []
+			ft = []
+			fave = []
+
+			I_t = []
+			I_lap = []
+
+			u_1 = []
+			u_2 = []
+			u_3 = []
+			u_4 = []
+			Z = []
+
+			# depth computation
+			# I used to be (960, 600, 2or 3) we change it to (2or3, 960, 600) 
+			tmp_I = tf.transpose(I, perm=[2,0,1])
+			for i in range(len(self.cfg)):
+				# initialize variables				
+				"""Input parameters"""
+				Z_0.append(tf.constant(self.cfg[0]['Z_0'], dtype = tf.float32))
+				a0.append(tf.constant(self.cfg[i]['a0'], dtype = tf.float32))
+
+				gauss.append(tf.Variable(self.cfg[i]['gauss'], dtype = tf.float32))
+				ext_f.append(tf.Variable(self.cfg[i]['ext_f'], dtype = tf.float32))
+				ft.append(tf.constant(self.cfg[i]['ft'], dtype = tf.float32))
+				fave.append(tf.constant(self.cfg[i]['fave'], dtype = tf.float32))
+
+				I_batch.append(tf.transpose(tmp_I,[1,2,0]))
+				tmp_I_blur = dIdx_batch(tmp_I, gauss[i])
+				I_lap_batch.append(tf.transpose(tmp_I - tmp_I_blur,[1,2,0]))
+
+				if i < len(self.cfg)-1:
+					tmp_I = tf.squeeze(\
+						tf.image.resize_bilinear(\
+							tf.expand_dims(
+								tmp_I_blur,-1
+							),
+							self.resolution[i+1],
+							align_corners = True
+						),[-1]
+					)
+
+				# Generate the differential images
+				I_t.append(dIdt(I_batch[i], ft[i]))
+				I_lap.append(dIdt(I_lap_batch[i], fave[i]))
+
+				# unwindowed version
+				u_1.append(I_lap[i])
+				u_2.append(I_t[i])
+				u_3.append(a0[i] * a1 * u_1[i])
+				u_4.append(-u_2[i] + a0[i] * u_1[i] + 1e-5)
+				ext_f[i] = tf.expand_dims(\
+					tf.transpose(ext_f[i], perm=[1,2,0]),-2
+				)
+				u_3[i] = tf.expand_dims(tf.expand_dims(u_3[i],0),-1)
+				u_4[i] = tf.expand_dims(tf.expand_dims(u_4[i],0),-1)
+				u_3[i] = tf.nn.conv2d(u_3[i], ext_f[i],[1,1,1,1],padding='SAME')[0,:,:,:]
+				u_4[i] = tf.nn.conv2d(u_4[i], ext_f[i],[1,1,1,1],padding='SAME')[0,:,:,:]
+				Z.append((u_3[i]*u_4[i]) / (u_4[i]*u_4[i] + 1e-5) + Z_0[0])
+
+				
+				#save references to required I/O]
+				self.vars.append({})
+				self.vars[i]['I'] = I_batch[i]
+				
+				# unwindowed version
+				self.vars[i]['u_1'] = u_1[i]
+				self.vars[i]['u_2'] = u_2[i]
+				self.vars[i]['u_3'] = u_3[i]
+				self.vars[i]['u_4'] = u_4[i]
+				self.vars[i]['Z'] = Z[i]
+
+			# align depth and confidence maps
+			self.align_maps_ext(['u_3','u_4'])
+
+			# compute the aligned version of Z
+			self.vars_align['Z'] = \
+				self.vars_align['u_3'] / (self.vars_align['u_4'] + 1e-5) + Z_0[0]
+
+			# compute windowed and unwindowed confidence
+			eval('self.'+self.cfg[0]['conf_func']+'()')
+
+			# save the ground truth
+			self.vars_fuse['Z_gt'] = Z_gt
+			Z_gt_tmp = [Z_gt for i in range(len(self.cfg))]
+			self.vars_align['Z_gt'] = tf.pack(Z_gt_tmp, 2)
+
+			# fusion
+			self.softmax_fusion()	
+
+			# cut out the region that do not work
+			self.valid_windowed_region_fuse()
+
+			#add values
+			#as number the inputs depends on num_py,
+			#we use string operations to do it
+			self.input_data = tf.group(\
+				I.assign(self.I_in),
+				a1.assign(self.a1_in),
+				Z_gt.assign(self.Z_in)
+			)
+
+			#do not add anything to the compute graph 
+			#after this line
+			init_op = tf.initialize_all_variables()
+			self.session.run(init_op)
+
+	def align_maps_ext(self, vars_to_fuse = None):
+		# this function aligns different
+		# res into the same one
+		if vars_to_fuse == None:
+			vars_to_fuse = self.vars_to_fuse
+		shp = self.resolution[0]
+		for var in vars_to_fuse:
+			self.vars_align[var] = []
+			for i in range(len(self.cfg)):
+				# align depth map and confidence
+				self.vars_align[var].append(\
+					tf.image.resize_bilinear(\
+						tf.expand_dims(
+							self.vars[i][var],0
+						),\
+						shp,
+						align_corners = True
+					)\
+				)
+			# concatenate the depth maps and confidence
+			self.vars_align[var] = tf.squeeze(
+				tf.concat(3, self.vars_align[var]), [0]
+			)
+		return 
+
+	def softmax_fusion(self):
+		# reshape for softmax
+		conf_flat = tf.reshape(
+			self.vars_align['conf'],
+			[-1, len(self.cfg)*self.cfg[0]['ext_f'].shape[0]]
+		)
+		
+		# not sure if it will cause numerical problem
+		ws = tf.reshape(
+			tf.nn.softmax(conf_flat*1e10),
+			self.resolution[0]+(-1,)
+		)
+
+		# fuse the results using softmax
+		for var in self.vars_to_fuse:
+			self.vars_fuse[var] = \
+				tf.reduce_sum(
+					self.vars_align[var]*ws,
+					[2]
+				)
+
+		return 
+
+	def w3_baseline_conf(self):
+		# this function computes the confidence and 
+		# uncertainty according to stability,
+		# use the working range to cut the confidence
+		# and use weight for each layer
+		# the windowed flag indicates whether we compute windowed
+		w_bc = [] # the weight of baseline confidence for each layer
+		w_bc1 = []
+		w_bc2 = []
+		k = 50
+		for i in range(len(self.cfg)):
+			# weights
+			w_bc.append(\
+				tf.Variable(
+					self.cfg[i]['w_bc'],
+					dtype = tf.float32
+				)	
+			)
+			w_bc1.append(\
+				tf.Variable(
+					self.cfg[i]['w_bc1'],
+					dtype = tf.float32
+				)	
+			)
+			w_bc2.append(\
+				tf.Variable(
+					self.cfg[i]['w_bc2'],
+					dtype = tf.float32
+				)
+			)
+
+			# unwindowed version
+			conf_tmp = []
+			for j in range(self.cfg[0]['ext_f'].shape[0]):
+				conf_tmp.append(
+					(self.vars[i]['u_4'][:,:,j]**2 + 1e-20)/\
+					tf.sqrt(\
+						w_bc[i][j] * self.vars[i]['u_3'][:,:,j]**2 + \
+						w_bc1[i][j] * self.vars[i]['u_4'][:,:,j]**2 + \
+						w_bc2[i][j] * self.vars[i]['u_3'][:,:,j]*self.vars[i]['u_4'][:,:,j] + \
+						self.vars[i]['u_4'][:,:,j]**4 + \
+						1e-10\
+					)
+				)
+			conf_tmp = tf.pack(conf_tmp, 2)
+
+			# final confidence
+			self.vars[i]['conf'] = conf_tmp
+			self.vars[i]['w_bc'] = w_bc[i]
+			self.vars[i]['w_bc1'] = w_bc1[i]
+			self.vars[i]['w_bc2'] = w_bc2[i]
+
+
+		# aligned version
+		# self.align_maps(['conf'])
+		conf_align = []
+
+		for i in range(len(self.cfg)):
+			for j in range(self.cfg[0]['ext_f'].shape[0]):
+				idx = i * (self.cfg[0]['ext_f'].shape[0]) + j
+				tmp_align = (self.vars_align['u_4'][:,:,idx]**2 + 1e-20)/\
+					tf.sqrt(\
+						w_bc[i][j] * self.vars_align['u_3'][:,:,idx]**2 + \
+						w_bc1[i][j] * self.vars_align['u_4'][:,:,idx]**2 + \
+						w_bc2[i][j] * self.vars_align['u_3'][:,:,idx]*self.vars_align['u_4'][:,:,idx] + \
+						self.vars_align['u_4'][:,:,idx]**4 + \
+						1e-10\
+					)	
+				# aligned confidence
+				conf_align.append(
+					tmp_align
+				)
+			self.vars[i]['conf_align'] = conf_align[i]
+
+			
+
+		self.vars_align['conf'] = tf.pack(conf_align,2)
+
+		return
+		
+	def valid_windowed_region_fuse(self):
+		# cut out the bad part
+		vars_to_cut = [\
+			'Z','conf','Z_gt'\
+		]
+		rows_cut = int(\
+			((self.cfg[-1]['gauss'].shape[0]-1)/2+\
+			(self.cfg[-1]['ext_f'].shape[1]-1)/2)*\
+			self.resolution[0][0]/self.resolution[-1][0]
+		)
+		cols_cut = int(\
+			((self.cfg[-1]['gauss'].shape[1]-1)/2+\
+			(self.cfg[-1]['ext_f'].shape[2]-1)/2)*\
+			self.resolution[0][1]/self.resolution[-1][1]
+		)
+		rows = self.cfg[0]['szx_sensor']
+		cols = self.cfg[0]['szy_sensor']
+
+		for var in vars_to_cut:
+			self.vars_fuse[var] = \
+				self.vars_fuse[var][
+					cols_cut:cols-cols_cut,
+					rows_cut:rows-rows_cut
+				]
+
+			if var != 'Z_gt':
+				self.vars_align[var] = \
+					self.vars_align[var][
+						cols_cut:cols-cols_cut,
+						rows_cut:rows-rows_cut,
+						:
+					]
+
+		return 
+
+	# query results
+	def regular_output(self, conf_thre=0, log = False):
+		res_dict = {}
+		for k in self.image_to_show:
+			res_dict[k] = self.vars_fuse[k]
+
+		self.results = self.session.run(res_dict)
+
+		rng = {}
+		for k in self.image_to_show:
+			if k in KEY_RANGE.keys():
+				rng[k] = KEY_RANGE[k]
+			else:
+				rng[k] = [np.NaN, np.NaN]
+
+			if (k == 'Z') and ('conf' in self.image_to_show):
+				self.results[k][np.where(self.results['conf']<conf_thre)]=np.NaN
+
+		self.cache['draw'] = tile_image(\
+									I = self.results, \
+									rng = rng, \
+									log = log, \
+									title = "Regular Output", \
+								)
+		cv2.imshow(self.netName, self.cache['draw'])
+
+	def query_results(self, query_list):
+		res_dict = {}
+		for k in query_list:
+			res_dict[k] = self.vars_fuse[k]
+		self.results = self.session.run(res_dict)
+		return self.results
+
+	def query_results_layered(self, query_list):
+		# query results from layered 
+		res_dict = [{} for i in range(len(self.cfg))]
+		self.results_layered = []
+		for i in range(len(self.cfg)):
+			for k in query_list:
+				res_dict[i][k] = self.vars[i][k]
+			self.results_layered.append(
+				self.session.run(res_dict[i])
+			)
+		return self.results_layered
+
+	def error_conf_map(self, Z_flat, Z_gt_flat, conf_flat, fig, s1,s2,s3, fig_name):
+		# this functions draws the error and confidence map
+		# compute average error
+		err = np.abs(Z_flat - Z_gt_flat)
+
+		# draw a fig that shows the average error with confidence > a threshold
+		# cut the confidence region into bin_nums bins, with starting and ending
+		# point in the center of the first and last bin respectively
+		bin_nums = 100
+		step = (
+			conf_flat.max().astype(np.float64)-
+			conf_flat.min().astype(np.float64)
+			)/(bin_nums-1)
+		conf_ranges = [conf_flat.min()-step/2, conf_flat.max()+step/2]
+
+		cedgs = np.linspace(conf_flat.min(), conf_flat.max(), 100, True)
+		err_sum = [0 for i in range(bin_nums)]
+		err_count = [0 for i in range(bin_nums)]
+
+		for i in range(bin_nums):
+			lo = conf_ranges[0] + step * i
+			hi = conf_ranges[0] + step * (i+1)
+			flg1 = conf_flat.astype(np.float64) >= lo
+			flg2 = conf_flat.astype(np.float64) < hi
+			idx = np.where(flg1 * flg2)
+			err_sum[i] = np.sum(err[idx])
+			err_count[i] = len(idx[0])
+
+		for i in range(bin_nums-1, 0, -1):
+			err_sum[i-1] += err_sum[i]
+			err_count[i-1] += err_count[i]
+
+		for i in range(bin_nums):
+			if err_count[i] != 0:
+				err_sum[i] /= err_count[i]
+				err_count[i] /= len(unconf_flat)
+
+		# draw the figure
+		title = fig_name
+		ax1 = fig.add_subplot(s1,s2,s3, title=title)
+		ax1.plot(cedgs, err_sum, 'b-')
+		ax1.set_xlabel('Confidence threshold x')
+		ax1.set_ylabel('Average error of conf > x (m)', color='b')
+
+		ax2 = ax1.twinx()
+		ax2.plot(cedgs, err_count, 'r-')
+		ax2.set_ylabel('Ratio of conf > x', color='r')
+
+		return 
+
+	def error_conf_map_log(self, Z_flat, Z_gt_flat, conf_flat, fig, s1,s2,s3, fig_name):
+		# this functions draws the error and confidence map using log scale of unconf
+		# ie max(conf)+delta-conf
+		unconf_flat = conf_flat.max() + 1e-5 - conf_flat
+		# compute average error
+		err = np.abs(Z_flat - Z_gt_flat)
+
+		# draw a fig that shows the average error with confidence > a threshold
+		# cut the confidence region into bin_nums bins, with starting and ending
+		# point in the center of the first and last bin respectively
+		bin_nums = 100
+		step = (
+			unconf_flat.max().astype(np.float64)/
+			unconf_flat.min().astype(np.float64)
+			)**(1/(bin_nums-1))
+		conf_ranges = [unconf_flat.min()/np.sqrt(step), unconf_flat.max()*np.sqrt(step)]
+
+		cedgs = np.logspace(0., 99., num=100, endpoint=True, base=step)*unconf_flat.min()
+		err_sum = [0 for i in range(bin_nums)]
+		err_count = [0 for i in range(bin_nums)]		
+
+		for i in range(bin_nums):
+			lo = conf_ranges[0] * step**i
+			hi = conf_ranges[0] * step**(i+1)
+			flg1 = unconf_flat.astype(np.float64) >= lo
+			flg2 = unconf_flat.astype(np.float64) < hi
+			idx = np.where(flg1 * flg2)
+			err_sum[i] = np.sum(err[idx])
+			err_count[i] = len(idx[0])
+
+		for i in range(bin_nums-1):
+			err_sum[i+1] += err_sum[i]
+			err_count[i+1] += err_count[i]
+
+		for i in range(bin_nums):
+			if err_count[i] != 0:
+				err_sum[i] /= err_count[i]
+				err_count[i] /= len(unconf_flat)
+
+		# draw the figure
+		x_tmp = np.arange(len(err_sum))
+		cedgs = conf_flat.max() + 1e-5 - cedgs
+		cedgs = np.flipud(cedgs)
+		cedgs = ["{:.4f}".format(i) for i in cedgs]
+		err_sum.reverse()
+		err_count.reverse()
+
+		title = fig_name+', max conf: '+str(conf_flat.max())
+		ax1 = fig.add_subplot(s1,s2,s3, title=title)
+		plt.xticks(x_tmp[0::11], cedgs[0::11])
+		ax1.plot(x_tmp, err_sum, 'b-')
+		ax1.set_xlabel('Unconfidence threshold x')
+		ax1.set_ylabel('Average error of unconf < x (m)', color='b')
+
+		ax2 = ax1.twinx()
+		ax2.plot(x_tmp, err_count, 'r-')
+		ax2.set_ylabel('Ratio of unconf < x', color='r')
+
+		return 
+
+	def sparsification_plt(self, Z_flat, Z_gt_flat, conf_flat, fig, s1,s2,s3, fig_name):
+		# this functions draws the error and confidence map
+		# compute average error
+		err = np.abs(Z_flat - Z_gt_flat).astype(np.float64)
+
+		# sort the conf_flat
+		err_sorted = err[np.argsort(conf_flat)]
+		sparse = np.arange(len(err))/len(err)
+		num = len(err) - np.arange(len(err))
+
+		for i in range(len(err)-1,0,-1):
+			err_sorted[i-1] += err_sorted[i]
+		err_sorted /= num
+
+		# draw a fig that shows the average error with a certain sparsication
+		bin_nums = 1000
+		step = np.linspace(0, len(err_sorted)-1, bin_nums, True).astype(np.int)
+		
+		err_show = err_sorted[step]
+		sparse_show = sparse[step]
+
+		# compute the AUC
+		area = np.mean(err_sorted)
+
+		# draw the figure
+		title = fig_name
+		ax1 = fig.add_subplot(s1,s2,s3, title=title+", area: "+str(area))
+		ax1.plot(sparse_show, err_show, '-')
+		ax1.set_xlabel('Sparsification')
+		ax1.set_ylabel('Average error')
+
+		return 
+
+	def area_under_spars_curve(self, Z_flat, Z_gt_flat, conf_flat):
+		# this functions draws the error and confidence map
+		# compute average error
+		err = np.abs(Z_flat - Z_gt_flat).astype(np.float64)
+
+		# sort the conf_flat
+		err_sorted = err[np.argsort(conf_flat)]
+		sparse = np.arange(len(err))/len(err)
+		num = len(err) - np.arange(len(err))
+
+		for i in range(len(err)-1,0,-1):
+			err_sorted[i-1] += err_sorted[i]
+		err_sorted /= num
+
+		# 
+		return np.mean(err_sorted)
+
+	def visual_mean_var(self, I, Loc, Z_f, conf_thre=0.):
+		# since the confidence is not necessary max to 1
+		# conf_thre is the threshold of the max confidence
+		# input images
+		Z_mean = np.zeros((len(I),), dtype = np.float32)
+		Z_std = np.zeros((len(I),), dtype = np.float32)
+		Z_gt = np.zeros((len(I),), dtype = np.float32)
+		counter = np.zeros((len(I),), dtype = np.float32)
+
+		for i in range(len(I)):
+			# input images
+			Z_gt_tmp = Loc[i,2,int((Loc.shape[2]-1)/2)]
+			if Z_gt_tmp in Z_gt:
+				j = np.where(Z_gt == Z_gt_tmp)[0][0]
+			else:
+				j = i
+			Z_gt[j] = Z_gt_tmp
+			counter[j] += 1
+			Z_map_gt = np.ones(I[i,:,:,0].shape) * Z_gt[j]
+			self.input_images(I[i,:,:,:], Z_map_gt, Z_f[j])
+
+			# # show the depth map
+			# self.regular_output(conf_thre=0.95)
+			# cv2.waitKey(1)
+
+			# Query some results for analysis, concatenate results
+			# for all images into a long vector
+			query_list = ['Z','Z_gt','conf']
+			res = self.query_results(query_list)
+
+			Z = res['Z'].flatten()
+			conf = res['conf'].flatten()
+
+			Z_mean[j] += np.mean(Z[np.where(conf>conf_thre)])
+			Z_std[j] += np.std(Z[np.where(conf>conf_thre)])
+
+		Z_mean /= counter
+		Z_std /= counter
+
+		# draw the histograms
+		fig = plt.figure()
+		Z_gt -= self.cfg[0]['Z_0']
+		Z_mean -= self.cfg[0]['Z_0']
+		plt.errorbar(Z_gt, Z_mean, Z_std, linestyle='None', marker='^')
+		min_depth = np.nanmin(Z_mean)
+		max_depth = np.nanmax(Z_mean)
+		min_depth = 0.3
+		max_depth = 1.1
+		plt.axis([min_depth, max_depth, min_depth, max_depth])
+		plt.plot([min_depth, max_depth], [min_depth, max_depth])
+		plt.show()
+		return 
+
+	def visual_heatmap(self, I, Loc, Z_f, conf_thre=0.):
+		# since the confidence is not necessary max to 1
+		# conf_thre is the threshold of the max confidence
+		# input images
+		Z_gt = Loc[0,2,int((Loc.shape[2]-1)/2)]
+		Z_map_gt = np.ones(I[0,:,:,0].shape) * Z_gt
+		self.input_images(I[0,:,:,:], Z_map_gt, Z_f[0])
+
+		# Initialization of recording for faster visualization
+		query_list = ['Z','Z_gt','conf']
+		res = self.query_results(query_list)
+
+		num_unw = len(res['Z'].flatten())
+		idx_unw = 0
+		Z_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+		Z_gt_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+		conf_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+
+
+		query_list_layered = ['Z', 'conf']
+		res_layered = self.query_results_layered(query_list_layered)
+
+		num_unw_l = [len(res_layered[j]['Z'].flatten()) for j in range(len(self.cfg))]
+		idx_unw_l = [0 for j in range(len(self.cfg))]
+		Z_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		Z_gt_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		conf_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+
+		for i in range(len(I)):
+			# input images
+			Z_gt = Loc[i,2,int((Loc.shape[2]-1)/2)]
+			Z_map_gt = np.ones(I[i,:,:,0].shape) * Z_gt
+			self.input_images(I[i,:,:,:], Z_map_gt, Z_f[i])
+
+			# # show the depth map
+			# self.regular_output(conf_thre=0.95)
+			# cv2.waitKey(1)
+
+			# Query some results for analysis, concatenate results
+			# for all images into a long vector
+			query_list = ['Z','Z_gt','conf']
+			res = self.query_results(query_list)
+
+			Z_flat[idx_unw:idx_unw+num_unw] = res['Z'].flatten()
+			Z_gt_flat[idx_unw:idx_unw+num_unw] = res['Z_gt'].flatten()
+			conf_flat[idx_unw:idx_unw+num_unw] = res['conf'].flatten()
+
+			idx_unw += num_unw
+
+			query_list_layered = ['Z', 'conf']
+			res_layered = self.query_results_layered(query_list_layered)
+			for j in range(len(self.cfg)):
+				Z_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					res_layered[j]['Z'].flatten()
+				Z_gt_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					np.ones(\
+						Z_gt_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]].shape
+					) * Z_gt
+				conf_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					res_layered[j]['conf'].flatten()
+
+				idx_unw_l[j] += num_unw_l[j]
+
+		# throw away all points with confidence smaller than conf_thre
+		conf_thre = 0
+		for j in range(len(self.cfg)):
+			idx = np.where(conf_flat_layered[j] > conf_thre)
+			Z_flat_layered[j] = Z_flat_layered[j][idx]
+			Z_gt_flat_layered[j] = Z_gt_flat_layered[j][idx]
+			conf_flat_layered[j] = conf_flat_layered[j][idx]
+
+		# draw the histograms
+		fig = plt.figure()
+		for i in range(len(self.cfg)):
+			self.heatmap(\
+				Z_flat_layered[i]-self.cfg[0]['Z_0'], 
+				Z_gt_flat_layered[i]-self.cfg[0]['Z_0'], 
+				fig, 
+				2,4,i+1, 
+				'i='+str(i)+',conf>'+ str(conf_thre)+','
+			)
+
+
+		conf_thre = [0,0.9,0.99,0.999]
+		for i in range(len(conf_thre)):
+			idx = np.where(conf_flat > conf_thre[i])
+			Z_flat = Z_flat[idx]
+			Z_gt_flat = Z_gt_flat[idx]
+			conf_flat = conf_flat[idx]
+			self.heatmap(\
+				Z_flat-self.cfg[0]['Z_0'], 
+				Z_gt_flat-self.cfg[0]['Z_0'], 
+				fig, 
+				2,4,i+5, 
+				'Z,conf>'+ str(conf_thre[i])
+			)
+
+		plt.show()
+		return 
+
+	def visual_heatmap_percent(self, I, Loc, Z_f, per_thre=0.):
+		# input images
+		Z_gt = Loc[0,2,int((Loc.shape[2]-1)/2)]
+		Z_map_gt = np.ones(I[0,:,:,0].shape) * Z_gt
+		self.input_images(I[0,:,:,:], Z_map_gt, Z_f[0])
+
+		# Initialization of recording for faster visualization
+		query_list = ['Z','Z_gt','conf']
+		res = self.query_results(query_list)
+
+		num_unw = len(res['Z'].flatten())
+		Z_flat = np.empty((num_unw,len(I)), dtype = np.float32)
+		Z_gt_flat = np.empty((num_unw,len(I)), dtype = np.float32)
+		conf_flat = np.empty((num_unw,len(I)), dtype = np.float32)
+
+		query_list_layered = ['Z', 'conf']
+		res_layered = self.query_results_layered(query_list_layered)
+
+		num_unw_l = [len(res_layered[j]['Z'].flatten()) for j in range(len(self.cfg))]
+		Z_flat_layered = [
+			np.empty((num_unw_l[j],len(I)), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		Z_gt_flat_layered = [
+			np.empty((num_unw_l[j],len(I)), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		conf_flat_layered = [
+			np.empty((num_unw_l[j],len(I)), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+
+		for i in range(len(I)):
+			# input images
+			Z_gt = Loc[i,2,int((Loc.shape[2]-1)/2)]
+			Z_map_gt = np.ones(I[i,:,:,0].shape) * Z_gt
+			self.input_images(I[i,:,:,:], Z_map_gt, Z_f[i])
+
+			# # show the depth map
+			# self.regular_output(conf_thre=0.95)
+			# cv2.waitKey(1)
+
+			# Query some results for analysis, concatenate results
+			# for all images into a long vector
+			query_list = ['Z','Z_gt','conf']
+			res = self.query_results(query_list)
+
+			Z_flat[:,i] = res['Z'].flatten()
+			Z_gt_flat[:,i] = res['Z_gt'].flatten()
+			conf_flat[:,i] = res['conf'].flatten()
+
+			query_list_layered = ['Z', 'conf']
+			res_layered = self.query_results_layered(query_list_layered)
+			for j in range(len(self.cfg)):
+				Z_flat_layered[j][:,i] = \
+					res_layered[j]['Z'].flatten()
+				Z_gt_flat_layered[j][:,i] = \
+					np.ones(Z_gt_flat_layered[j][:,i].shape) * Z_gt
+				conf_flat_layered[j][:,i] = \
+					res_layered[j]['conf'].flatten()
+
+		# throw away all points with confidence smaller than a certain percent
+		idx0 = np.argsort(conf_flat, axis=0)
+		idx1 = np.ones((conf_flat.shape[0],1),dtype=np.int) * \
+			np.array([np.arange(len(I))])
+		idx = (idx0.flatten(), idx1.flatten().astype(np.int))
+		cut_row = int(Z_flat.shape[0] * per_thre)
+
+		Z_flat = np.reshape(Z_flat[idx], Z_flat.shape)
+		Z_gt_flat = np.reshape(Z_gt_flat[idx], Z_gt_flat.shape)
+		Z_flat = Z_flat[cut_row:,:].flatten()
+		Z_gt_flat = Z_gt_flat[cut_row:,:].flatten()
+
+		for j in range(len(self.cfg)):
+			idx0 = np.argsort(conf_flat_layered[j], axis=0)
+			idx1 = np.ones((conf_flat_layered[j].shape[0],1),dtype=np.int) * \
+				np.array([np.arange(len(I))])
+			idx = (idx0.flatten(), idx1.flatten())
+			cut_row = int(Z_flat_layered[j].shape[0] * per_thre)
+
+			Z_flat_layered[j] = np.reshape(\
+				Z_flat_layered[j][idx],\
+				Z_flat_layered[j].shape
+			)
+			Z_gt_flat_layered[j] = np.reshape(\
+				Z_gt_flat_layered[j][idx],\
+				Z_gt_flat_layered[j].shape
+			)
+			Z_flat_layered[j] = Z_flat_layered[j][cut_row:,:].flatten()
+			Z_gt_flat_layered[j] = Z_gt_flat_layered[j][cut_row:,:].flatten()
+
+		# draw the histograms
+		fig = plt.figure()
+		self.heatmap(\
+			Z_flat, 
+			Z_gt_flat, 
+			fig, 
+			1,5,1, 
+			'fused_result'
+		)
+		for i in range(len(self.cfg)):
+			self.heatmap(\
+				Z_flat_layered[i], 
+				Z_gt_flat_layered[i], 
+				fig, 
+				1,5,i+2, 
+				'layer '+str(i)
+			)
+
+		plt.show()
+		return 
+
+	def visual_err_conf_map(self, I, Loc, Z_f, log=True):
+		# input images
+		Z_gt = Loc[0,2,int((Loc.shape[2]-1)/2)]
+		Z_map_gt = np.ones(I[0,:,:,0].shape) * Z_gt
+		self.input_images(I[0,:,:,:], Z_map_gt, Z_f[0])
+
+
+		# Initialization for recording for faster visualization
+		query_list = ['Z','Z_gt','conf']
+		res = self.query_results(query_list)
+
+		num_unw = len(res['Z'].flatten())
+		idx_unw = 0
+		Z_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+		Z_gt_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+		conf_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+
+		query_list_layered = ['Z', 'conf']
+		res_layered = self.query_results_layered(query_list_layered)
+
+		num_unw_l = [len(res_layered[j]['Z'].flatten()) for j in range(len(self.cfg))]
+		idx_unw_l = [0 for j in range(len(self.cfg))]
+		Z_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		Z_gt_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		conf_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+
+		for i in range(len(I)):
+			# input images
+			Z_gt = Loc[i,2,int((Loc.shape[2]-1)/2)]
+			Z_map_gt = np.ones(I[i,:,:,0].shape) * Z_gt
+			self.input_images(I[i,:,:,:], Z_map_gt, Z_f[i])
+
+			# # show the depth map
+			# self.regular_output(conf_thre=0.95)
+			# cv2.waitKey(1)
+
+			# Query some results for analysis, concatenate results
+			# for all images into a long vector
+			query_list = ['Z','Z_gt','conf']
+			res = self.query_results(query_list)
+
+			Z_flat[idx_unw:idx_unw+num_unw] = res['Z'].flatten()
+			Z_gt_flat[idx_unw:idx_unw+num_unw] = res['Z_gt'].flatten()
+			conf_flat[idx_unw:idx_unw+num_unw] = res['conf'].flatten()
+
+			idx_unw += num_unw
+			
+			query_list_layered = ['Z', 'conf']
+			res_layered = self.query_results_layered(query_list_layered)
+			for j in range(len(self.cfg)):
+				Z_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					res_layered[j]['Z'].flatten()
+				Z_gt_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					np.ones(
+						Z_gt_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]].shape
+					)* Z_gt
+				conf_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					res_layered[j]['conf'].flatten()
+
+				idx_unw_l[j] += num_unw_l[j]
+
+		# draw the performance measurement
+		if log:
+			fig = plt.figure()
+			self.error_conf_map_log(\
+				Z_flat, 
+				Z_gt_flat, 
+				conf_flat, 
+				fig, 
+				3,3,1, 
+				'fused result'
+			)
+			for i in range(len(self.cfg)):
+				self.error_conf_map_log(\
+					Z_flat_layered[i],
+					Z_gt_flat_layered[i],
+					conf_flat_layered[i],
+					fig,
+					3,3,i+2,
+					'layer '+str(i)
+				)
+		else:
+			fig = plt.figure()
+			self.error_conf_map(\
+				Z_flat, 
+				Z_gt_flat, 
+				conf_flat, 
+				fig, 
+				3,3,1, 
+				'fused result'
+			)
+			for i in range(len(self.cfg)):
+				self.error_conf_map(\
+					Z_flat_layered[i],
+					Z_gt_flat_layered[i],
+					conf_flat_layered[i],
+					fig,
+					3,3,i+2,
+					'layer '+str(i)
+				)
+				
+
+		plt.show()
+		return 
+
+	def sparsification_map(self, I, Loc, Z_f):
+		# input images
+		Z_gt = Loc[0,2,int((Loc.shape[2]-1)/2)]
+		Z_map_gt = np.ones(I[0,:,:,0].shape) * Z_gt
+		self.input_images(I[0,:,:,:], Z_map_gt, Z_f[0])
+
+
+		# Initialization for recording for faster visualization
+		query_list = ['Z','Z_gt','conf']
+		res = self.query_results(query_list)
+
+		num_unw = len(res['Z'].flatten())
+		idx_unw = 0
+		Z_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+		Z_gt_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+		conf_flat = np.empty((num_unw*len(I),), dtype = np.float32)
+
+		query_list_layered = ['Z', 'conf']
+		res_layered = self.query_results_layered(query_list_layered)
+
+		num_unw_l = [len(res_layered[j]['Z'].flatten()) for j in range(len(self.cfg))]
+		idx_unw_l = [0 for j in range(len(self.cfg))]
+		Z_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		Z_gt_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		conf_flat_layered = [
+			np.empty((num_unw_l[j]*len(I),), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+
+		for i in range(len(I)):
+			# input images
+			Z_gt = Loc[i,2,int((Loc.shape[2]-1)/2)]
+			Z_map_gt = np.ones(I[i,:,:,0].shape) * Z_gt
+			self.input_images(I[i,:,:,:], Z_map_gt, Z_f[i])
+
+			# # show the depth map
+			# self.regular_output(conf_thre=0.95)
+			# cv2.waitKey(1)
+
+			# Query some results for analysis, concatenate results
+			# for all images into a long vector
+			query_list = ['Z','Z_gt','conf']
+			res = self.query_results(query_list)
+
+			Z_flat[idx_unw:idx_unw+num_unw] = res['Z'].flatten()
+			Z_gt_flat[idx_unw:idx_unw+num_unw] = res['Z_gt'].flatten()
+			conf_flat[idx_unw:idx_unw+num_unw] = res['conf'].flatten()
+
+			idx_unw += num_unw
+
+			query_list_layered = ['Z', 'conf']
+			res_layered = self.query_results_layered(query_list_layered)
+			for j in range(len(self.cfg)):
+				Z_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					res_layered[j]['Z'].flatten()
+				Z_gt_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					np.ones(
+						Z_gt_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]].shape
+					) * Z_gt
+				conf_flat_layered[j][idx_unw_l[j]:idx_unw_l[j]+num_unw_l[j]] = \
+					res_layered[j]['conf'].flatten()
+
+				idx_unw_l[j] += num_unw_l[j]
+
+		# draw the performance measurement
+		fig = plt.figure()
+		self.sparsification_plt(\
+			Z_flat, 
+			Z_gt_flat, 
+			conf_flat, 
+			fig, 
+			3,3,1, 
+			'fused result'
+		)
+		for i in range(len(self.cfg)):
+			self.sparsification_plt(\
+				Z_flat_layered[i],
+				Z_gt_flat_layered[i],
+				conf_flat_layered[i],
+				fig,
+				3,3,i+2,
+				'layer '+str(i)
+			)
+			
+		plt.show()
+		return 
+
+	def AUC_map(self, I, Loc, Z_f):
+		# input images
+		Z_gt = Loc[0,2,int((Loc.shape[2]-1)/2)]
+		Z_map_gt = np.ones(I[0,:,:,0].shape) * Z_gt
+		self.input_images(I[0,:,:,:], Z_map_gt, Z_f[0])
+
+		# Initialization of recording for faster visualization
+		query_list = ['Z','Z_gt','conf']
+		res = self.query_results(query_list)
+
+		num_unw = len(res['Z'].flatten())
+		Z_flat = np.empty((num_unw,len(I)), dtype = np.float32)
+		Z_gt_flat = np.empty((num_unw,len(I)), dtype = np.float32)
+		conf_flat = np.empty((num_unw,len(I)), dtype = np.float32)
+
+		query_list_layered = ['Z', 'conf']
+		res_layered = self.query_results_layered(query_list_layered)
+
+		num_unw_l = [len(res_layered[j]['Z'].flatten()) for j in range(len(self.cfg))]
+		Z_flat_layered = [
+			np.empty((num_unw_l[j],len(I)), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		Z_gt_flat_layered = [
+			np.empty((num_unw_l[j],len(I)), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+		conf_flat_layered = [
+			np.empty((num_unw_l[j],len(I)), dtype = np.float32)\
+			for j in range(len(self.cfg))
+		]
+
+		for i in range(len(I)):
+			# input images
+			Z_gt = Loc[i,2,int((Loc.shape[2]-1)/2)]
+			Z_map_gt = np.ones(I[i,:,:,0].shape) * Z_gt
+			self.input_images(I[i,:,:,:], Z_map_gt, Z_f[i])
+
+			# # show the depth map
+			# self.regular_output(conf_thre=0.95)
+			# cv2.waitKey(1)
+
+			# Query some results for analysis, concatenate results
+			# for all images into a long vector
+			query_list = ['Z','Z_gt','conf']
+			res = self.query_results(query_list)
+
+			Z_flat[:,i] = res['Z'].flatten()
+			Z_gt_flat[:,i] = res['Z_gt'].flatten()
+			conf_flat[:,i] = res['conf'].flatten()
+
+			query_list_layered = ['Z', 'conf']
+			res_layered = self.query_results_layered(query_list_layered)
+			for j in range(len(self.cfg)):
+				Z_flat_layered[j][:,i] = \
+					res_layered[j]['Z'].flatten()
+				Z_gt_flat_layered[j][:,i] = \
+					np.ones(Z_gt_flat_layered[j][:,i].shape) * Z_gt
+				conf_flat_layered[j][:,i] = \
+					res_layered[j]['conf'].flatten()
+
+		AUC = np.empty((Z_flat.shape[1],))
+		AUC_layered = [
+			np.empty((Z_flat_layered[j].shape[1],))
+			for j in range(len(self.cfg))
+		]
+
+		# compute the AUC
+		for i in range(len(AUC)):
+			AUC[i] = self.area_under_spars_curve(
+				Z_flat[:,i],
+				Z_gt_flat[:,i],
+				conf_flat[:,i]
+			)
+
+			for j in range(len(self.cfg)):
+				AUC_layered[j][i] = self.area_under_spars_curve(
+					Z_flat_layered[j][:,i],
+					Z_gt_flat_layered[j][:,i],
+					conf_flat_layered[j][:,i]
+				)
+
+		# plot the AUC
+		fig = plt.figure()
+		ax = fig.add_subplot(3,3,1, title="fused result")
+		ax.plot(Z_gt_flat[0,:], AUC,'o')
+		for j in range(len(self.cfg)):
+			ax = fig.add_subplot(3,3,j+2, title="layer "+str(j))
+			ax.plot(Z_gt_flat_layered[j][0,:], AUC_layered[j], 'o')
+
+		plt.show()
+
+		
+		# save the data
+		lpickle = len(glob.glob('./test_results/pyConfLensFlowNetFast_ext/*.pickle'))
+		fileName = os.path.join(\
+			'./test_results/pyConfLensFlowNetFast_ext/'+str(lpickle)+".pickle"
+		)
+		with open(fileName,'wb') as f:
+			cfg_data = {
+				'Z_flat':				Z_flat,
+				'Z_gt_flat':			Z_gt_flat,
+				'conf_flat':			conf_flat,
+				'Z_flat_layered':		Z_flat_layered,
+				'Z_gt_flat_layered':	Z_gt_flat_layered,
+				'conf_flat_layered':	conf_flat_layered,
+				'AUC':					AUC,
+				'AUC_layered':			AUC_layered,
+			}
+			# dump the data into the file
+			pickle.dump(cfg_data, f)
