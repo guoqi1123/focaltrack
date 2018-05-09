@@ -2447,7 +2447,7 @@ def multithreading_test():
 	# initialize the pulsecam processor
 	# cfg_file = "./opt_results/pyConfLensFlowNetFast/"+\
 	# 	"1x1t-text34-setup5-py4-w3r-whole.pickle"
-	cfg_file = "./opt_results/pyConfLensFlowNetFast_ext/"+\
+	cfg_file = "./extra/params/"+\
 		"1x1t-text34-py4-setup5-one-sequential-regularize-nothreshold.pickle"
 	with open(cfg_file,'rb') as f:
 		cfg_data = pickle.load(f)
@@ -2457,7 +2457,7 @@ def multithreading_test():
 		cfg[i]['b0'] = 1e-4
 		cfg[i]['b1'] = -1.9
 
-	cfg_file = "./opt_results/pyConfLensFlowNetFast_iccv5/"+\
+	cfg_file = "./extra/params/"+\
 		"final.pickle"
 	with open(cfg_file,'rb') as f:
 		cfgf_data = pickle.load(f)
