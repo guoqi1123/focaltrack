@@ -54,6 +54,7 @@ KEY_RANGE = {
 }
 
 KEYS_TO_TILE = ['ATA', 'ATA^-1', 'ATb', 'U']
+
 class OutsideCamera(threading.Thread):
 	def __init__(self):
 		threading.Thread.__init__(self)
@@ -2435,7 +2436,11 @@ class Display(threading.Thread):
 		cv2.destroyAllWindows()
 
 
-def multithreading_test():
+if __name__== "__main__":
+	from sys import argv
+	myargs = getopts(argv)
+	pdb.set_trace()
+
 	# c = OutsideCamera()
 	a = Camera()
 
@@ -2480,7 +2485,3 @@ def multithreading_test():
 
 	b.join()
 	d.join()
-
-if __name__ == "__main__":
-	# debug_test()
-	multithreading_test()
